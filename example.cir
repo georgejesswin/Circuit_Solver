@@ -1,0 +1,6 @@
+
+
+V V1 1 0 10          ; 10 V source from node 1 to ground
+R R1 1 2 1000        ; 1 kΩ resistor between node 1 and node 2
+C C1 2 0 1e-6          ;
+L L1 2 0 10   ;
