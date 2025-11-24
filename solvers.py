@@ -1,223 +1,422 @@
+# solvers.py  — MNA-only symbolic circuit solver (clean, robust)
+# Always uses Modified Nodal Analysis (MNA) for consistency.
+
+from typing import List, Tuple, Dict, Any, Union, Optional
+import logging
+
 import sympy as sp
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ----------------------------------------------------------------------
-# Symbolic impedance/admittance matrices
-# ----------------------------------------------------------------------
+# configure logging for module users
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-def symbolic_ZY(circ, s: sp.Symbol):
+__all__ = [
+    "symbolic_ZY",
+    "solve_node_symbolic",  # kept as wrapper for compatibility (delegates to MNA)
+    "solve_mna_symbolic",
+    "solve_loop_symbolic",
+    "inverse_and_plot",
+]
+
+# ----------------- small helpers -------------------------------------------
+def _is_zero(expr: sp.Expr) -> bool:
+    try:
+        return sp.simplify(expr) == sp.S.Zero
+    except Exception:
+        return False
+
+
+def _to_sym(expr):
+    return sp.sympify(expr) if expr is not None else sp.S.Zero
+
+
+# ---------------------------------------------------------------------------
+# Symbolic Z/Y extraction
+# ---------------------------------------------------------------------------
+def symbolic_ZY(circ, s: sp.Symbol) -> Tuple[sp.Matrix, sp.Matrix, List[sp.Expr], List[sp.Expr]]:
     """
-    Compute symbolic impedance (Zb) and admittance (Yb) diagonal matrices.
+    Returns (Zb, Yb, Zlist, Ylist)
+    - Zb: diagonal matrix of branch impedances (with sp.S.Zero for ideal short)
+    - Yb: diagonal matrix of branch admittances (with sp.S.Zero for open/undefined)
+    - Zlist/Ylist: lists for each branch (branch order = circ.branches)
     """
-    Zlist = []
-    Ylist = []
+    Zlist: List[sp.Expr] = []
+    Ylist: List[sp.Expr] = []
+
     for br in circ.branches:
-        Z = br.impedance(s)
-        Zlist.append(Z)
-        Ylist.append(sp.Integer(0) if Z == sp.oo else sp.simplify(1 / Z))
+        Z = None
+        try:
+            Z = br.impedance(s)
+        except Exception:
+            # Ideal sources or unspecified impedance -> treat specially
+            if getattr(br, "btype", None) == "V":
+                Z = sp.S.Zero  # ideal short for impedance representation (handled elsewhere)
+            else:
+                Z = sp.oo
 
-    Zb = sp.diag(*[(sp.Integer(0) if z == sp.oo else z) for z in Zlist])
-    Yb = sp.diag(*Ylist)
+        try:
+            Z = sp.simplify(Z)
+        except Exception:
+            Z = sp.sympify(Z)
+
+        if Z == sp.oo:
+            Y = sp.S.Zero
+        else:
+            if Z == sp.S.Zero:
+                Y = sp.oo
+            else:
+                try:
+                    Y = sp.simplify(1 / Z)
+                except Exception:
+                    Y = sp.S.Zero
+
+        Zlist.append(Z)
+        Ylist.append(Y)
+
+    Zdiag = [(sp.S.Zero if z == sp.oo else z) for z in Zlist]
+    Zb = sp.diag(*Zdiag) if Zdiag else sp.zeros(0)
+    Yb = sp.diag(*Ylist) if Ylist else sp.zeros(0)
+
     return Zb, Yb, Zlist, Ylist
 
 
-# ----------------------------------------------------------------------
-# Node-based symbolic solver
-# ----------------------------------------------------------------------
-
-def solve_node_symbolic(circ, s: sp.Symbol):
+# ---------------------------------------------------------------------------
+# MNA solver (the single canonical solver used by this module)
+# ---------------------------------------------------------------------------
+def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     """
-    Node-voltage based symbolic solver.
-    Supports ideal voltage sources connected to the reference node only.
-    Treats independent voltage/current sources as step inputs (value/s) in Laplace domain.
-    Returns:
-        dict with {'Vn', 'Ib', 'Vb', 'names', 'ref_idx', 'Q'}
+    Always use Modified Nodal Analysis (MNA).
+    Returns dictionary with keys similar to earlier interface:
+      - 'Vn' : full node voltage vector (including reference at its proper index)
+      - 'I_branch' : branch currents (matching circ.branches order)
+      - 'V_branch' : branch voltages (V(n1) - V(n2))
+      - 'names' : list of node names (including reference)
+      - 'ref_idx' : index of reference node within names
+      - 'A_mna', 'b_mna' : final MNA matrix and RHS (useful for debugging)
     """
     Ared, names, ref_idx = circ.reduced_incidence()
+    node_list = [n for n in names if n != circ.ref_node]
+    N = len(node_list)
+
     Zb, Yb, Zlist, Ylist = symbolic_ZY(circ, s)
 
-    # Detect known voltages from ideal V sources to ground
-    # Treat V(s) = V0 / s  (step input)
-    known_V = {}
-    for br in circ.branches:
-        if br.btype == 'V':
-            if br.n2 == circ.ref_node and br.n1 != circ.ref_node:
-                known_V[br.n1] = sp.sympify(br.value) / s
-            elif br.n1 == circ.ref_node and br.n2 != circ.ref_node:
-                known_V[br.n2] = -sp.sympify(br.value) / s
+    # Collect voltage sources for MNA augmentation
+    v_sources = [(i, br) for i, br in enumerate(circ.branches) if getattr(br, "btype", None) == "V"]
+    M = len(v_sources)
 
-    unk_nodes = [n for n in names if n != circ.ref_node and n not in known_V]
-    unk_idx_map = {n: i for i, n in enumerate(unk_nodes)}
+    G = sp.zeros(N, N)
+    Ivec = sp.zeros(N, 1)
 
-    Vsymbols = sp.symbols(f"Vn0:{len(unk_nodes)}") if unk_nodes else ()
-    Vsym_map = {unk_nodes[i]: Vsymbols[i] for i in range(len(unk_nodes))}
+    def node_idx(n):
+        return None if n == circ.ref_node else node_list.index(n)
 
-    eqs = []
-    for u in unk_nodes:
-        expr = sp.Integer(0)
-        for i, br in enumerate(circ.branches):
-            Y = Ylist[i]
-            if br.n1 == u or br.n2 == u:
-                other = br.n2 if br.n1 == u else br.n1
-                Vu = _node_voltage(u, Vsym_map, known_V, circ.ref_node)
-                Vother = _node_voltage(other, Vsym_map, known_V, circ.ref_node)
-                if Y != sp.Integer(0):
-                    expr += sp.simplify(Y * (Vu - Vother))
-                if br.btype == 'I':
-                    # Treat current source as step in Laplace: I(s) = I0 / s
-                    Ival = sp.sympify(br.value) / s
-                    expr += Ival if br.n1 == u else -Ival
-        eqs.append(sp.simplify(expr))
+    # Assemble G and Ivec (for passive admittances and current sources)
+    for i, br in enumerate(circ.branches):
+        Y = Ylist[i]
+        n1 = br.n1
+        n2 = br.n2
 
-    if unk_nodes:
-        A_mat, b_vec = sp.linear_eq_to_matrix(eqs, list(Vsymbols))
-        try:
-            sol_vec = A_mat.LUsolve(b_vec)
-        except Exception:
-            sol = sp.solve(eqs, list(Vsymbols), dict=True)
-            sol_vec = sp.Matrix([sp.simplify(sol[0][sym]) for sym in Vsymbols]) if sol else sp.zeros(len(Vsymbols), 1)
-        full = _assemble_full_voltage_vector(names, circ.ref_node, known_V, Vsym_map, unk_idx_map, sol_vec)
+        if getattr(br, "btype", None) == "I":
+            Ival = sp.simplify(sp.sympify(br.value) / s)
+            idx1 = node_idx(n1)
+            idx2 = node_idx(n2)
+            if idx1 is not None:
+                Ivec[idx1, 0] -= Ival
+            if idx2 is not None:
+                Ivec[idx2, 0] += Ival
+
+        if not _is_zero(Y) and getattr(br, "btype", None) != "V":
+            idx1 = node_idx(n1)
+            idx2 = node_idx(n2)
+            if idx1 is not None:
+                G[idx1, idx1] += Y
+            if idx2 is not None:
+                G[idx2, idx2] += Y
+            if idx1 is not None and idx2 is not None:
+                G[idx1, idx2] -= Y
+                G[idx2, idx1] -= Y
+
+    # B and E for voltage sources
+    B = sp.zeros(N, M)
+    E = sp.zeros(M, 1)
+    for j, (branch_idx, br) in enumerate(v_sources):
+        n1 = br.n1
+        n2 = br.n2
+        idx1 = node_idx(n1)
+        idx2 = node_idx(n2)
+        if idx1 is not None:
+            B[idx1, j] = +1
+        if idx2 is not None:
+            B[idx2, j] = -1
+        E[j, 0] = sp.simplify(sp.sympify(br.value) / s)
+
+    # Build final MNA matrix
+    if N == 0 and M == 0:
+        A_mna = sp.zeros(0)
+        b_mna = sp.zeros(0, 1)
+        V_unknown = sp.zeros(0, 1)
+        I_v = sp.zeros(0, 1)
     else:
-        full = [_node_voltage(n, {}, known_V, circ.ref_node) for n in names]
+        if M == 0:
+            A_mna = G
+            b_mna = Ivec
+        elif N == 0:
+            A_mna = sp.zeros(M, M)
+            b_mna = E
+        else:
+            top = sp.Matrix.hstack(G, B)
+            bottom = sp.Matrix.hstack(B.T, sp.zeros(M, M))
+            A_mna = sp.Matrix.vstack(top, bottom)
+            b_mna = sp.Matrix.vstack(Ivec, E)
 
-    Vb = sp.Matrix([full[names.index(br.n1)] - full[names.index(br.n2)] for br in circ.branches])
-    Ib_adm = sp.Matrix([
-        sp.Integer(0) if Ylist[i] == sp.Integer(0) else sp.simplify(Ylist[i] * Vb[i])
-        for i in range(len(circ.branches))
-    ])
-    # Current sources contribution treated as I0/s
-    Isrc = sp.Matrix([sp.sympify(br.value) / s if br.btype == 'I' else 0 for br in circ.branches])
-    Ib = sp.simplify(Ib_adm + Isrc)
+        try:
+            sol = A_mna.LUsolve(b_mna)
+        except Exception:
+            try:
+                x_syms = sp.Matrix(sp.symbols(f"x0:{A_mna.shape[1]}"))
+                sol_list = sp.solve(A_mna * x_syms - b_mna, list(x_syms), dict=True)
+                if sol_list:
+                    sol = sp.Matrix([sp.simplify(sol_list[0][sym]) for sym in list(x_syms)])
+                else:
+                    sol = sp.zeros(A_mna.shape[1], 1)
+            except Exception:
+                sol = sp.zeros(A_mna.shape[1], 1)
 
-    return {'Vn': sp.Matrix(full), 'Ib': Ib, 'Vb': Vb, 'names': names, 'ref_idx': ref_idx, 'Q': Ared}
+        V_unknown = sol[:N, :] if N > 0 else sp.zeros(0, 1)
+        I_v = sol[N:, :] if M > 0 else sp.zeros(0, 1)
+
+    # Build full node voltages list aligned with names
+    Vn_full: List[sp.Expr] = []
+    for n in names:
+        if n == circ.ref_node:
+            Vn_full.append(sp.S.Zero)
+        else:
+            idx = node_list.index(n)
+            Vn_full.append(sp.simplify(V_unknown[idx, 0]))
+
+    # Branch voltages and currents
+    Vb = sp.Matrix([Vn_full[names.index(br.n1)] - Vn_full[names.index(br.n2)] for br in circ.branches])
+
+    vs_branch_to_iv = {branch_idx: -I_v[j, 0] for j, (branch_idx, br) in enumerate(v_sources)} if M > 0 else {}
+
+    Ib_list: List[sp.Expr] = []
+    for i, br in enumerate(circ.branches):
+        if getattr(br, "btype", None) == "V":
+            Ib_list.append(sp.simplify(vs_branch_to_iv.get(i, sp.S.Zero)))
+        elif getattr(br, "btype", None) == "I":
+            Ib_list.append(sp.simplify(sp.sympify(br.value) / s))
+        else:
+            Y = Ylist[i]
+            if _is_zero(Y) or Y == sp.oo:
+                Ib_list.append(sp.S.Zero)
+            else:
+                Ib_list.append(sp.simplify(Y * Vb[i]))
+    Ib = sp.Matrix(Ib_list)
+
+    return {
+        "Vn": sp.Matrix(Vn_full),
+        "I_branch": Ib,
+        "V_branch": Vb,
+        "names": names,
+        "ref_idx": ref_idx,
+        "A_mna": A_mna,
+        "b_mna": b_mna,
+    }
 
 
-# ----------------------------------------------------------------------
-# Loop-based symbolic solver
-# ----------------------------------------------------------------------
-
-def solve_loop_symbolic(circ, s: sp.Symbol):
+# ---------------------------------------------------------------------------
+# Backwards-compatible wrapper: always delegate to MNA (simpler API)
+# ---------------------------------------------------------------------------
+def solve_node_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     """
-    Loop-current based symbolic solver.
-    Treats independent voltage sources as step inputs (value/s).
-    Returns:
-        dict with {'B', 'I_l', 'I_b', 'V_b'}
+    Wrapper kept for compatibility with code that calls solve_node_symbolic.
+    Internally this always uses MNA for robust and consistent results.
     """
+    logger.debug("solve_node_symbolic: delegating to solve_mna_symbolic (MNA-only mode)")
+    out = solve_mna_symbolic(circ, s)
+
+    # For compatibility with older callers expecting 'Ib'/'Vb' keys used by nodal solver,
+    # keep those names as aliases.
+    return {
+        "Vn": out["Vn"],
+        "Ib": out["I_branch"],
+        "Vb": out["V_branch"],
+        "names": out["names"],
+        "ref_idx": out["ref_idx"],
+        "A_mna": out.get("A_mna"),
+        "b_mna": out.get("b_mna"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Loop solver (kept for completeness)
+# ---------------------------------------------------------------------------
+def _voltage_source_value(circ, br, s: sp.Symbol) -> sp.Expr:
+    if getattr(br, "btype", None) == "V":
+        return sp.simplify(sp.sympify(br.value) / s)
+    return sp.S.Zero
+
+
+def solve_loop_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     B, tree_edges, chords = circ.fundamental_tieset()
-    if isinstance(B, sp.Matrix) and B.rows == 0:
-        raise RuntimeError("No independent loops found.")
+    if not isinstance(B, sp.Matrix) or B.rows == 0:
+        raise RuntimeError("No independent loops found for loop analysis.")
+
     Zb, Yb, Zlist, Ylist = symbolic_ZY(circ, s)
 
-    # Vs entries now use step representation: V0 / s
     Vs = sp.Matrix([_voltage_source_value(circ, br, s) for br in circ.branches])
-    Zdiag = [sp.Integer(0) if z == sp.oo else z for z in Zlist]
-    Zb_short = sp.diag(*Zdiag)
+
+    Zdiag = [sp.S.Zero if z == sp.oo else z for z in Zlist]
+    Zb_short = sp.diag(*Zdiag) if Zdiag else sp.zeros(0)
 
     BZBt = sp.simplify(B * Zb_short * B.T)
     BV = sp.simplify(B * Vs)
+
     Il_syms = sp.symbols(f"Il0:{B.rows}")
     Il_vec = sp.Matrix(Il_syms)
 
-    sol = sp.solve(BZBt * Il_vec - BV, list(Il_vec), dict=True)
-    Il = sp.Matrix([sp.simplify(sol[0][sym]) for sym in Il_syms]) if sol else sp.zeros(B.rows, 1)
+    try:
+        sol_dicts = sp.solve(BZBt * Il_vec - BV, list(Il_vec), dict=True)
+    except Exception:
+        sol_dicts = []
+
+    if sol_dicts:
+        Il = sp.Matrix([sp.simplify(sol_dicts[0][sym]) for sym in Il_syms])
+    else:
+        try:
+            Il = BZBt.LUsolve(BV)
+        except Exception:
+            Il = sp.zeros(B.rows, 1)
 
     Ib = sp.simplify(B.T * Il)
     Vb = sp.simplify(Zb_short * Ib + Vs)
 
-    return {'B': B, 'I_l': Il, 'I_b': Ib, 'V_b': Vb}
+    return {"B": B, "I_l": Il, "I_b": Ib, "V_b": Vb}
 
 
-# ----------------------------------------------------------------------
-# Inverse Laplace Transform and plotting
-# ----------------------------------------------------------------------
+def inverse_and_plot(
+    expressions,
+    s,
+    t_sym,
+    tv=None,
+    t_end=0.01,
+    n_pts=1000,
+    title_prefix="sig",
+    ylabel="Signal",
+    mode="stacked",
+    verbose=True,
+):
+    import sympy as sp
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-def inverse_and_plot(expressions, s, t, label_prefix, ylabel):
-    """
-    Performs inverse Laplace transform for a list of symbolic expressions.
-    Returns time-domain numeric data for plotting.
-    """
-    tv = np.linspace(0, 0.01, 1000)
+    items = []
+    if isinstance(expressions, sp.Matrix):
+        for i in range(expressions.rows):
+            items.append((expressions[i, 0], f"{title_prefix}{i}"))
+    elif isinstance(expressions, (list, tuple)):
+        for i, e in enumerate(expressions):
+            if isinstance(e, (list, tuple)) and len(e) == 2:
+                items.append((sp.simplify(e[0]), str(e[1])))
+            else:
+                items.append((sp.simplify(e), f"{title_prefix}{i}"))
+    else:
+        items = [(sp.simplify(expressions), f"{title_prefix}0")]
+
+    if tv is None:
+        tv = np.linspace(0, t_end, n_pts)
+    else:
+        tv = np.asarray(tv, float)
+
     results = {}
-    for i, expr in enumerate(expressions):
-        inv, y = _safe_inverse(expr, s, t, tv)
-        if inv is not None:
-            results[f"{label_prefix}{i}"] = y
-            print(f"Inverse Laplace {label_prefix}{i} ->")
-            sp.pprint(inv)
+    for expr, label in items:
+        try:
+            inv = sp.simplify(sp.inverse_laplace_transform(expr, s, t_sym))
+            f = sp.lambdify(t_sym, inv, ["numpy", {"Heaviside": np.heaviside}])
+            y = np.array(f(tv), dtype=float)
 
-    if results:
-        plt.figure(figsize=(8, 4))
-        for k, v in results.items():
-            plt.plot(tv, v, label=k)
+            if y.ndim == 0:
+                y = np.ones_like(tv) * float(y)
+            elif y.shape != tv.shape:
+                try:
+                    y = y.reshape(tv.shape)
+                except:
+                    y = np.ones_like(tv) * float(np.mean(y))
+
+            results[label] = y
+
+        except Exception:
+            continue
+
+    if len(results) == 0:
+        return results
+
+    labels = list(results.keys())
+    signals = list(results.values())
+    colors = plt.cm.tab10(np.linspace(0, 1, len(signals)))
+
+    if mode == "stacked":
+        n = len(signals)
+        fig, axes = plt.subplots(n, 1, figsize=(10, 2.6 * n), sharex=True)
+        if n == 1:
+            axes = [axes]
+
+        for idx, (label, y) in enumerate(results.items()):
+            ax = axes[idx]
+            ax.plot(tv, y, color=colors[idx], linewidth=1.8)
+            ymin, ymax = np.min(y), np.max(y)
+            r = ymax - ymin or 1e-12
+            ax.set_ylim(ymin - 0.1*r, ymax + 0.1*r)
+            ax.set_ylabel(label, rotation=0, labelpad=40, fontsize=11)
+            ax.grid(True, linestyle="--", alpha=0.4)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["left"].set_linewidth(1.2)
+            ax.spines["bottom"].set_linewidth(1.2)
+
+        axes[-1].set_xlabel("Time (s)")
+        fig.suptitle(f"{ylabel} – {title_prefix}", fontsize=14)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.show()
+
+    elif mode == "offset":
+        plt.figure(figsize=(10, 5))
+        peak_ranges = [np.ptp(y) for y in signals]
+        base = np.max(peak_ranges) or 1
+        offset_step = 0.25 * base
+        for idx, (label, y) in enumerate(results.items()):
+            offset = idx * offset_step
+            plt.plot(tv, y + offset, label=f"{label} (+{offset:.3g})",
+                     alpha=0.85, linewidth=1.8, color=colors[idx])
+        plt.grid(True, linestyle="--", alpha=0.4)
         plt.xlabel("Time (s)")
         plt.ylabel(ylabel)
-        plt.title(f"{ylabel} (time domain)")
-        plt.grid(True)
+        plt.title(f"{ylabel} – {title_prefix}")
         plt.legend()
+        plt.tight_layout()
         plt.show()
+
+    elif mode == "overlaid":
+        plt.figure(figsize=(10, 5))
+        for idx, (label, y) in enumerate(results.items()):
+            plt.plot(tv, y, label=label, linewidth=1.8, color=colors[idx])
+        plt.grid(True, linestyle="--", alpha=0.4)
+        plt.xlabel("Time (s)")
+        plt.ylabel(ylabel)
+        plt.title(f"{ylabel} – {title_prefix}")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
     else:
-        print(f"No {ylabel.lower()} signals to plot.")
+        raise ValueError("mode must be 'stacked', 'offset', or 'overlaid'")
 
     return results
 
 
-# ----------------------------------------------------------------------
-# Internal helper functions
-# ----------------------------------------------------------------------
-
-def _node_voltage(node, Vsym_map, known_V, ref_node):
-    if node in Vsym_map:
-        return Vsym_map[node]
-    if node in known_V:
-        return known_V[node]
-    if node == ref_node:
-        return sp.Integer(0)
-    return sp.Integer(0)
-
-def _assemble_full_voltage_vector(names, ref_node, known_V, Vsym_map, unk_idx_map, sol_vec):
-    full = []
-    for n in names:
-        if n == ref_node:
-            full.append(sp.Integer(0))
-        elif n in known_V:
-            full.append(sp.simplify(known_V[n]))
-        elif n in Vsym_map:
-            full.append(sp.simplify(sol_vec[unk_idx_map[n]]))
-        else:
-            full.append(sp.Integer(0))
-    return full
-
-def _voltage_source_value(circ, br, s: sp.Symbol):
-    """
-    Return Laplace-domain voltage for a branch:
-      - If branch is V and one terminal is reference, return ±(value/s)
-      - Otherwise return value/s for general V source (user warned elsewhere)
-      - Non-voltage branches return 0
-    """
-    if br.btype == 'V':
-        if br.n2 == circ.ref_node:
-            return sp.sympify(br.value) / s
-        elif br.n1 == circ.ref_node:
-            return -sp.sympify(br.value) / s
-        else:
-            return sp.sympify(br.value) / s
-    return sp.Integer(0)
-
-def _safe_inverse(expr, s, t, tv):
-    try:
-        inv = sp.inverse_laplace_transform(sp.simplify(expr), s, t)
-        inv = sp.simplify(inv)
-        f = sp.lambdify(t, inv, modules=['numpy', {'Heaviside': lambda x: np.heaviside(x, 1)}])
-        y = f(tv)
-        y = np.array(y, dtype=float)
-        if y.ndim == 0 or y.size == 1:
-            y = np.ones_like(tv) * float(y)
-        elif y.shape != tv.shape:
-            try:
-                y = y.reshape(tv.shape)
-            except Exception:
-                y = np.ones_like(tv) * float(np.mean(y))
-        return inv, y
-    except Exception:
-        return None, None
