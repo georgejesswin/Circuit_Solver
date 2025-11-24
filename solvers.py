@@ -1,5 +1,4 @@
-# solvers.py  — MNA-only symbolic circuit solver (clean, robust)
-# Always uses Modified Nodal Analysis (MNA) for consistency.
+# solvers.py  — MNA-only symbolic circuit solver
 
 from typing import List, Tuple, Dict, Any, Union, Optional
 import logging
@@ -8,7 +7,6 @@ import sympy as sp
 import numpy as np
 import matplotlib.pyplot as plt
 
-# configure logging for module users
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     handler = logging.StreamHandler()
@@ -18,13 +16,13 @@ logger.setLevel(logging.INFO)
 
 __all__ = [
     "symbolic_ZY",
-    "solve_node_symbolic",  # kept as wrapper for compatibility (delegates to MNA)
+    "solve_node_symbolic", 
     "solve_mna_symbolic",
     "solve_loop_symbolic",
     "inverse_and_plot",
 ]
 
-# ----------------- small helpers -------------------------------------------
+
 def _is_zero(expr: sp.Expr) -> bool:
     try:
         return sp.simplify(expr) == sp.S.Zero
@@ -36,9 +34,6 @@ def _to_sym(expr):
     return sp.sympify(expr) if expr is not None else sp.S.Zero
 
 
-# ---------------------------------------------------------------------------
-# Symbolic Z/Y extraction
-# ---------------------------------------------------------------------------
 def symbolic_ZY(circ, s: sp.Symbol) -> Tuple[sp.Matrix, sp.Matrix, List[sp.Expr], List[sp.Expr]]:
     """
     Returns (Zb, Yb, Zlist, Ylist)
@@ -54,9 +49,8 @@ def symbolic_ZY(circ, s: sp.Symbol) -> Tuple[sp.Matrix, sp.Matrix, List[sp.Expr]
         try:
             Z = br.impedance(s)
         except Exception:
-            # Ideal sources or unspecified impedance -> treat specially
             if getattr(br, "btype", None) == "V":
-                Z = sp.S.Zero  # ideal short for impedance representation (handled elsewhere)
+                Z = sp.S.Zero 
             else:
                 Z = sp.oo
 
@@ -85,10 +79,6 @@ def symbolic_ZY(circ, s: sp.Symbol) -> Tuple[sp.Matrix, sp.Matrix, List[sp.Expr]
 
     return Zb, Yb, Zlist, Ylist
 
-
-# ---------------------------------------------------------------------------
-# MNA solver (the single canonical solver used by this module)
-# ---------------------------------------------------------------------------
 def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     """
     Always use Modified Nodal Analysis (MNA).
@@ -105,8 +95,6 @@ def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     N = len(node_list)
 
     Zb, Yb, Zlist, Ylist = symbolic_ZY(circ, s)
-
-    # Collect voltage sources for MNA augmentation
     v_sources = [(i, br) for i, br in enumerate(circ.branches) if getattr(br, "btype", None) == "V"]
     M = len(v_sources)
 
@@ -116,7 +104,6 @@ def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     def node_idx(n):
         return None if n == circ.ref_node else node_list.index(n)
 
-    # Assemble G and Ivec (for passive admittances and current sources)
     for i, br in enumerate(circ.branches):
         Y = Ylist[i]
         n1 = br.n1
@@ -141,8 +128,6 @@ def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
             if idx1 is not None and idx2 is not None:
                 G[idx1, idx2] -= Y
                 G[idx2, idx1] -= Y
-
-    # B and E for voltage sources
     B = sp.zeros(N, M)
     E = sp.zeros(M, 1)
     for j, (branch_idx, br) in enumerate(v_sources):
@@ -155,8 +140,6 @@ def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
         if idx2 is not None:
             B[idx2, j] = -1
         E[j, 0] = sp.simplify(sp.sympify(br.value) / s)
-
-    # Build final MNA matrix
     if N == 0 and M == 0:
         A_mna = sp.zeros(0)
         b_mna = sp.zeros(0, 1)
@@ -191,7 +174,6 @@ def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
         V_unknown = sol[:N, :] if N > 0 else sp.zeros(0, 1)
         I_v = sol[N:, :] if M > 0 else sp.zeros(0, 1)
 
-    # Build full node voltages list aligned with names
     Vn_full: List[sp.Expr] = []
     for n in names:
         if n == circ.ref_node:
@@ -199,8 +181,6 @@ def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
         else:
             idx = node_list.index(n)
             Vn_full.append(sp.simplify(V_unknown[idx, 0]))
-
-    # Branch voltages and currents
     Vb = sp.Matrix([Vn_full[names.index(br.n1)] - Vn_full[names.index(br.n2)] for br in circ.branches])
 
     vs_branch_to_iv = {branch_idx: -I_v[j, 0] for j, (branch_idx, br) in enumerate(v_sources)} if M > 0 else {}
@@ -230,9 +210,6 @@ def solve_mna_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Backwards-compatible wrapper: always delegate to MNA (simpler API)
-# ---------------------------------------------------------------------------
 def solve_node_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     """
     Wrapper kept for compatibility with code that calls solve_node_symbolic.
@@ -240,9 +217,6 @@ def solve_node_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
     """
     logger.debug("solve_node_symbolic: delegating to solve_mna_symbolic (MNA-only mode)")
     out = solve_mna_symbolic(circ, s)
-
-    # For compatibility with older callers expecting 'Ib'/'Vb' keys used by nodal solver,
-    # keep those names as aliases.
     return {
         "Vn": out["Vn"],
         "Ib": out["I_branch"],
@@ -253,10 +227,6 @@ def solve_node_symbolic(circ, s: sp.Symbol) -> Dict[str, Any]:
         "b_mna": out.get("b_mna"),
     }
 
-
-# ---------------------------------------------------------------------------
-# Loop solver (kept for completeness)
-# ---------------------------------------------------------------------------
 def _voltage_source_value(circ, br, s: sp.Symbol) -> sp.Expr:
     if getattr(br, "btype", None) == "V":
         return sp.simplify(sp.sympify(br.value) / s)
@@ -418,5 +388,6 @@ def inverse_and_plot(
         raise ValueError("mode must be 'stacked', 'offset', or 'overlaid'")
 
     return results
+
 
 
