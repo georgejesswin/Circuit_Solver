@@ -82,8 +82,19 @@ class SchematicEditor(tk.Tk):
             b.pack(anchor="w", padx=10, pady=2)
 
         ttk.Separator(tools_frame).pack(fill=tk.X, pady=10)
-
+        
+        ttk.Button(tools_frame, text="Show Graph", command=self.show_graph).pack(fill=tk.X, padx=5, pady=2)
         ttk.Button(tools_frame, text="Solve (Laplace)", command=self.solve_circuit).pack(fill=tk.X, padx=5, pady=2)
+        # --- Simulation Time Input ---
+        ttk.Label(tools_frame, text="Simulation Time (s)", font=("Arial", 9, "bold")).pack(pady=(10, 0))
+        self.sim_time_var = tk.StringVar(value="1.0")
+        ttk.Entry(tools_frame, textvariable=self.sim_time_var).pack(fill=tk.X, padx=5, pady=2)
+        #ttk.Button(tools_frame, text="Print Indices", command=self.show_indices).pack(fill=tk.X, padx=5, pady=2)
+
+        
+        ttk.Button(tools_frame, text="Time-Domain Expressions", command=self.show_time_domain_exprs).pack(fill=tk.X, padx=5, pady=2)
+
+
         ttk.Button(tools_frame, text="Plot Time Domain", command=self.plot_results).pack(fill=tk.X, padx=5, pady=2)
         ttk.Button(tools_frame, text="Clear Canvas", command=self.clear_canvas).pack(fill=tk.X, padx=5, pady=10)
         ttk.Button(tools_frame, text="Save Schematic", command=self.save_schematic).pack(fill=tk.X, padx=5, pady=2)
@@ -743,7 +754,54 @@ class SchematicEditor(tk.Tk):
             return sp.simplify(expr)
         except Exception:
             return expr
+    def _get_parsed_circuit(self):
+        cir = self.get_cir_text()
+        path = self._build_temp_netlist(cir)
+        return parse_netlist(path)
+    def show_matrices(self):
+        if not BACKEND_AVAILABLE:
+            self.log("Backend not available.")
+            return
 
+        circ = self._get_parsed_circuit()
+        s = sp.symbols('s')
+        Ared, names_all, ref_idx = circ.reduced_incidence()
+        Bmat, tree_edges, chords = circ.fundamental_tieset()
+
+        top = tk.Toplevel(self)
+        top.title("Circuit Matrices")
+        txt = scrolledtext.ScrolledText(top, width=120, height=35)
+        txt.pack(fill=tk.BOTH, expand=True)
+
+        def write(name, M):
+            txt.insert(tk.END, f"\n=== {name} ===\n")
+            arr = np.array(M.tolist(), dtype=object)
+            for row in arr:
+                txt.insert(tk.END, " ".join([str(x) for x in row]) + "\n")
+        write("Reduced incidence matrix A_red", Ared)
+        write("Tie-set matrix B", Bmat)
+
+        txt.insert(tk.END, "\nTree edges:\n")
+        for e in tree_edges:
+            txt.insert(tk.END, f"  {e}\n")
+        txt.insert(tk.END, "\nChords:\n")
+        for c in chords:
+            txt.insert(tk.END, f"  {c}\n")
+
+        txt.configure(state="disabled")
+
+
+    def show_graph(self):
+        if not BACKEND_AVAILABLE:
+            self.log("Backend not available.")
+            return
+
+        circ = self._get_parsed_circuit()
+        try:
+            circ.draw_graph()
+            self.log("Graph drawn in separate window.")
+        except Exception as e:
+            self.log(f"Graph error: {e}")
     def _detect_floating_vsource(self, circ):
         ref = getattr(circ, 'ref_node', None)
         for br in getattr(circ, 'branches', []):
@@ -753,6 +811,43 @@ class SchematicEditor(tk.Tk):
             if btype == 'V' and ref is not None and n1 != ref and n2 != ref:
                 return True
         return False
+    def show_time_domain_exprs(self):
+        if not hasattr(self, 'last_result'):
+            self.log("Solve first.")
+            return
+
+        s, t = sp.symbols('s t')
+        res = self.last_result
+        top = tk.Toplevel(self)
+        top.title("Time-Domain Expressions")
+        txt = scrolledtext.ScrolledText(top, width=100, height=35)
+        txt.pack(fill=tk.BOTH, expand=True)
+
+    # Node voltages
+        txt.insert(tk.END, "=== Node Voltages (time domain) ===\n")
+        if res.get("Vn"):
+            for i, expr in enumerate(res["Vn"]):
+                try:
+                    f_t = sp.inverse_laplace_transform(expr, s, t)
+                except:
+                    f_t = "Cannot invert"
+                txt.insert(tk.END, f"n{i}(t) = {sp.simplify(f_t)}\n\n")
+        else:
+            txt.insert(tk.END, "(No node voltages)\n")
+
+    # Currents
+        txt.insert(tk.END, "\n=== Branch Currents (time domain) ===\n")
+        if res.get("Ib"):
+            for i, expr in enumerate(res["Ib"]):
+                try:
+                    f_t = sp.inverse_laplace_transform(expr, s, t)
+                except:
+                    f_t = "Cannot invert"
+                txt.insert(tk.END, f"Ib{i}(t) = {sp.simplify(f_t)}\n\n")
+        else:
+            txt.insert(tk.END, "(No branch currents)\n")
+
+        txt.configure(state="normal")
 
     def _normalize_solver_result(self, res):
         out = {}
@@ -778,7 +873,6 @@ class SchematicEditor(tk.Tk):
         with os.fdopen(fd, 'w') as f:
             f.write(cir_text)
         return path
-
     def _solve_backend_from_cir(self, cir_text):
         if not BACKEND_AVAILABLE:
             self.log("Backend not available.")
@@ -816,8 +910,18 @@ class SchematicEditor(tk.Tk):
             try:
                 if not floating_vs:
                     raw = solve_node_symbolic(circ, s)
+                    # --- Add branch metadata for labeling plots ---
+                    raw["branch_labels"] = [br.name for br in circ.branches]
+                    raw["branch_types"]  = [br.btype for br in circ.branches]
+                    raw["branch_nodes"]  = [(br.n1, br.n2) for br in circ.branches]
+
                 else:
                     raw = solve_mna_symbolic(circ, s)
+                    # --- Add branch metadata for labeling plots ---
+                    raw["branch_labels"] = [br.name for br in circ.branches]
+                    raw["branch_types"]  = [br.btype for br in circ.branches]
+                    raw["branch_nodes"]  = [(br.n1, br.n2) for br in circ.branches]
+
             except Exception as e:
                 self.log(f"Symbolic solver error: {e}")
                 return None
@@ -884,13 +988,17 @@ class SchematicEditor(tk.Tk):
         if not hasattr(self, 'last_result'):
             self.log("Nothing to plot. Solve first.")
             return
-
+        try:
+            t_end = float(self.sim_time_var.get())
+        except Exception:
+            self.log("Invalid simulation time entered.")
+            return
         res = self.last_result
         s, t = sp.symbols('s t')
 
         if res.get('Vn'):
             try:
-                inverse_and_plot(res['Vn'], s, t, title_prefix="n", ylabel="Voltage (V)")
+                inverse_and_plot(res['Vn'], s, t, title_prefix="n", ylabel="Voltage (V)",t_end=t_end)
                 self.log("Plotted node voltages.")
             except Exception as e:
                 self.log(f"Plot Error (Voltages): {e}")
@@ -899,7 +1007,15 @@ class SchematicEditor(tk.Tk):
 
         if res.get('Ib'):
             try:
-                inverse_and_plot(res['Ib'], s, t, title_prefix="b", ylabel="Current (A)")
+                labels = []
+                if res.get("branch_labels"):
+                    for i, name in enumerate(res["branch_labels"]):
+                        btype = res["branch_types"][i]
+                        n1, n2 = res["branch_nodes"][i]
+                        labels.append(f"{name} ({btype}: {n1}->{n2})")
+                else:
+                    labels = None
+                inverse_and_plot(res['Ib'], s, t, title_prefix="Ib", ylabel="Current (A)", series_labels=labels, t_end=t_end)
                 self.log("Plotted branch currents.")
             except Exception as e:
                 self.log(f"Plot Error (Currents): {e}")
